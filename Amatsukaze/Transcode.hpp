@@ -56,14 +56,16 @@ void FreePicture(AVFrame*& pPicture)
 
 class Frame {
 public:
-	Frame()
-		: frame_()
+	Frame(int frameIndex)
+		: frameIndex_(frameIndex)
+		, frame_()
 	{
 		frame_ = av_frame_alloc();
 	}
 	Frame(const Frame& src) {
 		frame_ = av_frame_alloc();
 		av_frame_ref(frame_, src());
+		frameIndex_ = src.frameIndex_;
 	}
 	~Frame() {
 		av_frame_free(&frame_);
@@ -78,6 +80,8 @@ public:
 		av_frame_unref(frame_);
 		av_frame_ref(frame_, src());
 	}
+
+	int frameIndex_;
 private:
 	AVFrame* frame_;
 };
@@ -213,7 +217,7 @@ public:
 		}
 
     bool first = true;
-		Frame frame;
+		Frame frame(-1);
 		AVPacket packet = AVPacket();
 		while (av_read_frame(inputCtx(), &packet) == 0) {
 			if (packet.stream_index == videoStream->index) {
@@ -362,7 +366,7 @@ private:
   // 2つのフレームのトップフィールド、ボトムフィールドを合成
   static std::unique_ptr<av::Frame> mergeFields(av::Frame& topframe, av::Frame& bottomframe)
   {
-    auto dstframe = std::unique_ptr<av::Frame>(new av::Frame());
+    auto dstframe = std::unique_ptr<av::Frame>(new av::Frame(-1));
 
     AVFrame* top = topframe();
     AVFrame* bottom = bottomframe();
@@ -640,8 +644,8 @@ public:
     }
     if (fieldMode_) {
       // フィールドモードのときはtop,bottomの2つに分けて出力
-      av::Frame top = av::Frame();
-      av::Frame bottom = av::Frame();
+      av::Frame top = av::Frame(-1);
+      av::Frame bottom = av::Frame(-1);
       splitFrameToFields(frame, top, bottom);
       videoWriter_->inputFrame(top);
       videoWriter_->inputFrame(bottom);

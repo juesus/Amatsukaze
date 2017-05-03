@@ -142,6 +142,9 @@ static ENUM_ENCODER encoderFtomString(const std::tstring& str) {
 	else if (str == _T("nvenc") || str == _T("NVEnc")) {
 		return ENCODER_NVENC;
 	}
+	else if (str == _T("ffmpeg")) {
+		return ENCODER_FFMPEG;
+	}
 	return (ENUM_ENCODER)-1;
 }
 

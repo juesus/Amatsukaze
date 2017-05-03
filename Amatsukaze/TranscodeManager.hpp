@@ -17,6 +17,7 @@
 #include "StreamUtils.hpp"
 #include "TsSplitter.hpp"
 #include "Transcode.hpp"
+#include "VideoFilter.hpp"
 #include "StreamReform.hpp"
 #include "PacketCache.hpp"
 
@@ -76,6 +77,7 @@ enum ENUM_ENCODER {
 	ENCODER_X265,
 	ENCODER_QSVENC,
 	ENCODER_NVENC,
+	ENCODER_FFMPEG,
 };
 
 struct BitrateSetting {
@@ -101,6 +103,7 @@ static const char* encoderToString(ENUM_ENCODER encoder) {
 	case ENCODER_X265: return "x265";
 	case ENCODER_QSVENC: return "QSVEnc";
 	case ENCODER_NVENC: return "NVEnc";
+	case ENCODER_FFMPEG: return "FFmpeg";
 	}
 	return "Unknown";
 }
@@ -115,6 +118,11 @@ static std::string makeEncoderArgs(
 	std::ostringstream ss;
 
 	ss << "\"" << binpath << "\"";
+
+	if (encoder == ENCODER_FFMPEG) {
+		ss << " -i - " << options;
+		return ss.str();
+	}
 
 	// y4mヘッダにあるので必要ない
 	//ss << " --fps " << fmt.frameRateNum << "/" << fmt.frameRateDenom;
@@ -157,8 +165,11 @@ static std::string makeEncoderArgs(
 	case ENCODER_NVENC:
 		ss << " --format raw --y4m -i -";
 		break;
+	case ENCODER_FFMPEG:
+		ss << " -i -";
+		break;
 	}
-	
+
 	return ss.str();
 }
 
@@ -863,7 +874,7 @@ private:
 	// 2つのフレームのトップフィールド、ボトムフィールドを合成
 	static std::unique_ptr<av::Frame> mixFields(av::Frame& topframe, av::Frame& bottomframe)
 	{
-		auto dstframe = std::unique_ptr<av::Frame>(new av::Frame());
+		auto dstframe = std::unique_ptr<av::Frame>(new av::Frame(-1));
 
 		AVFrame* top = topframe();
 		AVFrame* bottom = bottomframe();
@@ -943,11 +954,21 @@ public:
 		: AMTObject(ctx)
 		, setting_(setting)
 		, reformInfo_(reformInfo)
-		, thread_(this, 8)
 		, prevFrameIndex_()
 		, pd_data_(NULL)
+		, filterTop_(NULL)
+		, filterBottom_(NULL)
+		, preFilter_(this, true)
+		, postFilter_(this, false)
 	{
-		//
+		addFilter(&threads_[0]);
+		addFilter(&preFilter_);
+		addFilter(&threads_[1]);
+		if (true) {
+			addFilter(&cnrFilter_);
+			addFilter(&threads_[2]);
+		}
+		//addFilter(&postFilter_);
 	}
 
 	~AMTVideoEncoder() {
@@ -1017,27 +1038,57 @@ private:
 			, this_(this_)
 		{ }
   protected:
-    virtual void onVideoFormat(AVStream *stream, VideoFormat fmt) { }
+    virtual void onVideoFormat(AVStream *stream, VideoFormat fmt) {
+			this_->nrFilter_.init(5, 7, !fmt.progressive);
+			this_->cnrFilter_.init(5, 7, 8, !fmt.progressive);
+		}
     virtual void onFrameDecoded(av::Frame& frame) {
-      this_->onFrameDecoded(frame);
+			// フレームをコピーしてフィルタに渡す
+			this_->filterTop_->onFrame(std::unique_ptr<av::Frame>(new av::Frame(frame)));
     }
     virtual void onAudioPacket(AVPacket& packet) { }
 	private:
 		AMTVideoEncoder* this_;
 	};
 
-	class SpDataPumpThread : public DataPumpThread<std::unique_ptr<av::Frame>> {
+	class ThreadFilter : public VideoFilter, private DataPumpThread<std::unique_ptr<av::Frame>> {
 	public:
-		SpDataPumpThread(AMTVideoEncoder* this_, int bufferingFrames)
-			: DataPumpThread(bufferingFrames)
-			, this_(this_)
+		ThreadFilter() : DataPumpThread(8)
 		{ }
-	protected:
-		virtual void OnDataReceived(std::unique_ptr<av::Frame>&& data) {
-			this_->onFrameReceived(std::move(data));
+		virtual void start() {
+			DataPumpThread<std::unique_ptr<av::Frame>>::start();
+		}
+		virtual void onFrame(std::unique_ptr<av::Frame>&& frame) {
+			put(std::move(frame), 1);
+		}
+		virtual void finish() {
+			join();
 		}
 	private:
+		virtual void OnDataReceived(std::unique_ptr<av::Frame>&& data) {
+			sendFrame(std::move(data));
+		}
+	};
+
+	class PrePostFilter : public VideoFilter {
+	public:
+		PrePostFilter(AMTVideoEncoder* this_, bool pre) : this_(this_), pre_(pre) { }
+		virtual void onFrame(std::unique_ptr<av::Frame>&& frame) {
+			if (pre_) {
+				if (this_->preFilterFrame(*frame)) {
+					// NV12 -> YV12変換
+					sendFrame(this_->toYV12(std::move(frame)));
+				}
+			}
+			else {
+				this_->postFilterFrame(std::move(frame));
+			}
+		}
+		virtual void start() { }
+		virtual void finish() { }
+	private:
 		AMTVideoEncoder* this_;
+		bool pre_;
 	};
 
 	const TranscoderSetting& setting_;
@@ -1049,12 +1100,29 @@ private:
 	std::stringstream* pd_data_;
   std::vector<EncodeFileInfo> efi_;
 	
-	SpDataPumpThread thread_;
+	VideoFilter* filterTop_;
+	VideoFilter* filterBottom_;
+
+	ThreadFilter threads_[4];
+	PrePostFilter preFilter_;
+	PrePostFilter postFilter_;
+	TemporalNRFilter nrFilter_;
+	CudaTemporalNRFilter cnrFilter_;
+
 	int prevFrameIndex_;
 
 	RFFExtractor rffExtractor_;
 
-
+	void addFilter(VideoFilter* filter)
+	{
+		if (filterTop_ == NULL) {
+			filterTop_ = filterBottom_ = filter;
+		}
+		else {
+			filterBottom_->nextFilter = filter;
+			filterBottom_ = filter;
+		}
+	}
   void processAllData(bool fieldMode, int bufsize, std::function<std::string(int,int)> getOptions, int pass)
   {
     // 初期化
@@ -1074,16 +1142,20 @@ private:
       encoders_[i].start(args, format.videoFormat, fieldMode, bufsize);
     }
 
-    // エンコードスレッド開始
-    thread_.start();
+    // フィルタ開始
+		for (auto f = filterTop_; f != NULL; f = f->nextFilter) {
+			f->start();
+		}
 
     // エンコード
     std::string intVideoFilePath = setting_.getIntVideoFilePath(videoFileIndex_);
     reader.readAll(intVideoFilePath,
 			setting_.getMpeg2Decoder(), setting_.getH264Decoder(), DECODER_DEFAULT);
 
-    // エンコードスレッドを終了して自分に引き継ぐ
-    thread_.join();
+    // フィルタを終了して自分に引き継ぐ
+		for (auto f = filterTop_; f != NULL; f = f->nextFilter) {
+			f->finish();
+		}
 
     // 残ったフレームを処理
     for (int i = 0; i < numEncoders_; ++i) {
@@ -1101,16 +1173,20 @@ private:
 		pd_data_ = new std::stringstream[numEncoders_];
 		SpVideoReader reader(this);
 
-		// エンコードスレッド開始
-		thread_.start();
+		// フィルタ開始
+		for (auto filter = filterTop_; filter != NULL; filter = filter->nextFilter) {
+			filter->start();
+		}
 
 		// エンコード
 		std::string intVideoFilePath = setting_.getIntVideoFilePath(videoFileIndex_);
 		reader.readAll(intVideoFilePath,
 			setting_.getMpeg2Decoder(), setting_.getH264Decoder(), DECODER_DEFAULT);
 
-		// エンコードスレッドを終了して自分に引き継ぐ
-		thread_.join();
+		// フィルタを終了して自分に引き継ぐ
+		for (auto filter = filterTop_; filter != NULL; filter = filter->nextFilter) {
+			filter->finish();
+		}
 
 		// ファイル出力
 		for (int i = 0; i < numEncoders_; ++i) {
@@ -1137,11 +1213,6 @@ private:
     return ((double)srcBytes * 8 / 1000) / ((double)srcDuration / MPEG_CLOCK_HZ);
   }
 
-	void onFrameDecoded(av::Frame& frame__) {
-		// フレームをコピーしてスレッドに渡す
-		thread_.put(std::unique_ptr<av::Frame>(new av::Frame(frame__)), 1);
-	}
-
 	const char* toPulldownFlag(PICTURE_TYPE pic, bool progressive) {
 		switch (pic) {
 		case PIC_FRAME: return "SGL";
@@ -1164,7 +1235,7 @@ private:
 
 		//printf("f");
 
-		auto dstframe = std::unique_ptr<av::Frame>(new av::Frame());
+		auto dstframe = std::unique_ptr<av::Frame>(new av::Frame(frame->frameIndex_));
 
 		AVFrame* src = (*frame)();
 		AVFrame* dst = (*dstframe)();
@@ -1214,12 +1285,12 @@ private:
 		return std::move(dstframe);
 	}
 
-	void onFrameReceived(std::unique_ptr<av::Frame>&& frame) {
-
+	bool preFilterFrame(av::Frame& frame)
+	{
 		// ffmpegがどうptsをwrapするか分からないので入力データの
 		// 下位33bitのみを見る
 		//（26時間以上ある動画だと重複する可能性はあるが無視）
-		int64_t pts = (*frame)()->pts & ((int64_t(1) << 33) - 1);
+		int64_t pts = frame()->pts & ((int64_t(1) << 33) - 1);
 
 		int frameIndex = reformInfo_.getVideoFrameIndex(pts, videoFileIndex_);
 		if (frameIndex == -1) {
@@ -1231,29 +1302,37 @@ private:
 			prevFrameIndex_ = frameIndex;
 		}
 
-		VideoFrameInfo info = reformInfo_.getVideoFrameInfo(frameIndex);
-		int encoderIndex = reformInfo_.getEncoderIndex(frameIndex);
+		frame.frameIndex_ = frameIndex;
 
 		if (pd_data_ != NULL) {
 			// pulldownファイル生成中
+			VideoFrameInfo info = reformInfo_.getVideoFrameInfo(frameIndex);
+			int encoderIndex = reformInfo_.getEncoderIndex(frameIndex);
 			auto& ss = pd_data_[encoderIndex];
 			ss << toPulldownFlag(info.pic, info.progressive) << std::endl;
-			return;
+			return false;
 		}
 
-		auto& encoder = encoders_[encoderIndex];
+		return true;
+	}
 
-		// NV12 -> YV12変換
-		auto frameYV12 = toYV12(std::move(frame));
+	void postFilterFrame(std::unique_ptr<av::Frame>&& frame)
+	{
+		int frameIndex = frame->frameIndex_;
+
+		VideoFrameInfo info = reformInfo_.getVideoFrameInfo(frameIndex);
+		int encoderIndex = reformInfo_.getEncoderIndex(frameIndex);
+
+		auto& encoder = encoders_[encoderIndex];
 
 		if (reformInfo_.isVFR() || setting_.isPulldownEnabled()) {
 			// VFRの場合は必ず１枚だけ出力
 			// プルダウンが有効な場合はフラグで処理するので１枚だけ出力
-			encoder.inputFrame(*frameYV12);
+			encoder.inputFrame(*frame);
 		}
 		else {
 			// RFFフラグ処理
-			rffExtractor_.inputFrame(encoder, std::move(frameYV12), info.pic);
+			rffExtractor_.inputFrame(encoder, std::move(frame), info.pic);
 		}
 
 		reformInfo_.frameEncoded(frameIndex);
@@ -1750,6 +1829,10 @@ static void transcodeMain(AMTContext& ctx, const TranscoderSetting& setting)
     }
 	}
 	encoder = nullptr;
+
+	if (setting.getEncoder() == ENCODER_FFMPEG) {
+		return;
+	}
 
 	auto audioDiffInfo = reformInfo.prepareMux();
 	audioDiffInfo.printAudioPtsDiff(ctx);
