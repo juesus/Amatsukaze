@@ -15,7 +15,7 @@ using Amatsukaze.Models;
 
 namespace Amatsukaze.ViewModels
 {
-    public class SettingViewModel : NamedViewModel
+    public class BasicSettingPanelViewModel : NamedViewModel
     {
         /* コマンド、プロパティの定義にはそれぞれ 
          * 

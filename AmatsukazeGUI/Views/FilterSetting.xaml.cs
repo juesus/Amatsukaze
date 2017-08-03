@@ -16,11 +16,11 @@ using System.Windows.Shapes;
 namespace Amatsukaze.Views
 {
     /// <summary>
-    /// SettingTab.xaml の相互作用ロジック
+    /// FilterSetting.xaml の相互作用ロジック
     /// </summary>
-    public partial class SettingPanel : UserControl
+    public partial class FilterSetting : UserControl
     {
-        public SettingPanel()
+        public FilterSetting()
         {
             InitializeComponent();
         }

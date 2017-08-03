@@ -208,7 +208,7 @@ namespace Amatsukaze.ViewModels
             Model = new ClientModel();
             MainPanelMenu.Add(new QueueViewModel() { Name = "キュー", Model = Model });
             MainPanelMenu.Add(new LogViewModel() { Name = "ログ", Model = Model });
-            MainPanelMenu.Add(new SettingViewModel() { Name = "設定", Model = Model });
+            MainPanelMenu.Add(new SettingPanelViewModel() { Name = "設定", Model = Model });
             ConsolePanelMenu.Add(new LogFileViewModel() { Name = "ログファイル", Model = Model });
             InfoPanelMenu.Add(new DiskFreeSpaceViewModel() { Name = "ディスク空き", Model = Model });
             InfoPanelMenu.Add(new SummaryViewModel() { Name = "サマリー", Model = Model });
